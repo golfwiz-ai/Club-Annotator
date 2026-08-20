@@ -1,0 +1,10 @@
+venv/
+__pycache__/
+*.pyc
+output/
+.DS_Store
+.app_version
+videos/*
+!videos/.gitkeep
+annotations/*
+!annotations/.gitkeep
