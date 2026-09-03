@@ -25,6 +25,7 @@ jobs:
             artifact: GolfWizAnnotator-windows
             binary: dist/GolfWizAnnotator.exe
             launcher: Start Annotator (Windows).bat
+            flags: --noconsole
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
@@ -34,7 +35,7 @@ jobs:
       - name: Install deps
         run: pip install opencv-python numpy cryptography pyinstaller
       - name: Build
-        run: pyinstaller --onefile --noconfirm --clean --name GolfWizAnnotator annotate.py
+        run: pyinstaller --onefile --noconfirm --clean --name GolfWizAnnotator ${{ matrix.flags }} annotate.py
       - name: Assemble package
         shell: bash
         run: |
