@@ -424,7 +424,11 @@ class Annotator:
             return frame
         # INTER_NEAREST: interpolation would smear hot pixels
         big = cv2.resize(m, (self.dw, self.dh), interpolation=cv2.INTER_NEAREST)
-        heat = cv2.applyColorMap(big, cv2.COLORMAP_INFERNO)
+        # display gain: membership values live mostly in 25-80/255, which the
+        # colormap renders near-black — brighten for DISPLAY only (the hot
+        # threshold below still uses the raw values)
+        heat = cv2.applyColorMap(cv2.convertScaleAbs(big, alpha=3.0),
+                                 cv2.COLORMAP_INFERNO)
         if mode == "HEAT ONLY":
             return heat
         # OVERLAY: blend the colormap onto hot pixels only
