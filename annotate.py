@@ -551,6 +551,11 @@ class Annotator:
     def run(self):
         cv2.namedWindow("GolfWiz Annotator")
         cv2.setMouseCallback("GolfWiz Annotator", self.on_mouse)
+        try:      # bring to front when launched detached
+            cv2.setWindowProperty("GolfWiz Annotator", cv2.WND_PROP_TOPMOST, 1)
+            cv2.setWindowProperty("GolfWiz Annotator", cv2.WND_PROP_TOPMOST, 0)
+        except cv2.error:
+            pass
         while True:
             self.draw()
             k = cv2.waitKey(20) & 0xFF
@@ -632,6 +637,15 @@ def gui_pick_video():
     root.title("GolfWiz Annotator")
     root.geometry("860x560")
     root.configure(bg="#1c1a18")
+    # Launched detached (launcher closes the terminal), the window can appear
+    # behind everything with no focus — looks like the app never opened.
+    root.lift()
+    root.attributes("-topmost", True)
+    root.after(600, lambda: root.attributes("-topmost", False))
+    try:
+        root.focus_force()
+    except tk.TclError:
+        pass
 
     style = ttk.Style(root)
     try:
