@@ -23,24 +23,35 @@ pre-installed except Python 3.
 
 ## Getting started
 
-1. Download this repository (green **Code** button → *Download ZIP*) and
-   unzip it anywhere — no GitHub account or git needed.
-2. Make sure Python 3 is installed
-   ([python.org](https://www.python.org/downloads/); on Windows tick
-   *"Add python.exe to PATH"* in the installer).
-3. Drop your swing clips into the `videos/` folder. Subfolders are fine —
-   everything inside is discovered automatically, and your original files
-   are never modified.
+The app ships as a self-contained binary — **no Python, no dependencies, no
+internet needed** after the download.
+
+1. Download the package for your OS from the
+   [latest release](https://github.com/golfwiz-ai/Club-Annotator/releases/latest),
+   or with curl:
+
+   ```bash
+   # macOS
+   curl -L -O https://github.com/golfwiz-ai/Club-Annotator/releases/latest/download/GolfWizAnnotator-macos.zip
+
+   # Windows
+   curl -L -O https://github.com/golfwiz-ai/Club-Annotator/releases/latest/download/GolfWizAnnotator-windows.zip
+
+   # Linux
+   curl -L -O https://github.com/golfwiz-ai/Club-Annotator/releases/latest/download/GolfWizAnnotator-linux.zip
+   ```
+
+2. Unzip it anywhere.
+3. Drop your swing clips into the `videos/` folder inside. Subfolders are
+   fine — everything inside is discovered automatically, and your original
+   files are never modified.
 4. Double-click the launcher for your OS:
 
    | OS | Launcher |
    |---|---|
    | macOS | `Start Annotator.command` (first time: right-click → Open, it's unsigned) |
-   | Windows | `Start Annotator (Windows).bat` |
-   | Linux | `run.sh` (choose *"Run in terminal"* if asked; adds a **Swing Annotator** menu entry after the first run) |
-
-   The first launch takes about a minute: it creates a private Python
-   environment and installs OpenCV. Every launch after that is instant.
+   | Windows | `Start Annotator (Windows).bat` (SmartScreen: *More info → Run anyway* the first time) |
+   | Linux | `run-annotator.sh` (choose *"Run in terminal"* if asked) |
 
 ## Using the app
 
