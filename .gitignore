@@ -1,10 +1,18 @@
+# local data — never push annotation work, audit trails, or exports
+annotations/
+exports/
+Output/
+videos/
+*.audit.log
+.audit.log
+
+# keys — the private key must NEVER enter this repo
+*.pem
+*.key
+
+# build junk
 venv/
+dist/
+build/
+*.spec
 __pycache__/
-*.pyc
-output/
-.DS_Store
-.app_version
-videos/*
-!videos/.gitkeep
-annotations/*
-!annotations/.gitkeep
