@@ -1,187 +1,274 @@
 #!/usr/bin/env python3
-"""Two-click club annotator (standalone).
+"""GolfWiz two-click club annotator.
 
 Each frame needs TWO clicks:
-    1st click = CLUB HEAD        (red dot)
-    2nd click = SHAFT END / grip (yellow dot)
-A green shaft line joins them and the tool auto-advances to the next
-un-annotated frame.
+    1st click = CLUB HEAD          (red dot)
+    2nd click = SHAFT END / grip   (yellow dot)
+A green shaft line joins them and the tool auto-advances to the next frame.
 
-Videos are discovered RECURSIVELY under videos/ (subfolders welcome).
-The originals are never touched. On first open, each clip is assigned an
-output slot:
+Output:
+    annotations/<CLIP>.csv
+    frame,head_x,head_y,grip_x,grip_y,state,ts     state = ok | occluded
+(older CSVs without the ts column load fine and are upgraded on save)
 
-    output/<YYYY-MM-DD>/<YYYY-MM-DD>_<serial>.<ext>   copy of the video
-    output/<YYYY-MM-DD>/<YYYY-MM-DD>_<serial>.csv    its annotation
-
-    CSV columns: frame,head_x,head_y,grip_x,grip_y,state   state = ok|occluded
-
-output/manifest.json remembers which source video maps to which slot, so
-re-opening the same clip resumes the same CSV instead of creating a new one.
+Videos: drop files, a folder of videos, or folders-of-folders into videos/ —
+everything is found automatically.
 
 Keys:
-    left click       place clubhead, then grip (auto-advance after grip)
-    n / right / d    next frame            p / left / a   previous frame
-    N / D            +10 frames            P / A          -10 frames
-    u / backspace    undo this frame's annotation
-    x                mark frame OCCLUDED (club not visible)
-    X (shift-x)      mark the LAST EDITED frame occluded and return to it
-    j                jump to next UN-annotated frame
-    z                toggle 3x loupe at the cursor (precise clicking)
-    s                save now (also autosaves on every edit and on quit)
-    q / esc          quit (saves)
+    left click   place head, then shaft end (auto-advance after 2nd click)
+    x            mark frame OCCLUDED (club not visible) and advance
+    u            undo this frame's annotation
+    n            jump to next un-annotated frame
+    a / d        previous / next frame
+    v            cycle view: frame / heat overlay / heat only
+    z            toggle 3x loupe at the cursor (precise clicking)
+    e            export today's session (also the EXPORT button)
+    s            save now (autosaves on every edit anyway)
+    q / ESC      save and quit
 """
 
 import csv
+import glob
+import hashlib
 import json
 import os
-import shutil
 import sys
-from datetime import date
+import time
+import zipfile
+from datetime import datetime, date
 
 import cv2
+import numpy as np
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+# When frozen by PyInstaller, __file__ lives in a temp extraction dir —
+# anchor all data folders next to the executable instead.
+if getattr(sys, "frozen", False):
+    HERE = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    HERE = os.path.dirname(os.path.abspath(__file__))
+ANN_DIR = os.path.join(HERE, "annotations")
 VID_DIR = os.path.join(HERE, "videos")
-OUT_DIR = os.path.join(HERE, "output")
-MANIFEST = os.path.join(OUT_DIR, "manifest.json")
-VIDEO_EXTS = (".mov", ".mp4", ".avi", ".m4v")
-MAX_DISP_H = 900          # fit tall phone video onto screen
-LOUPE = 3                 # magnifier zoom factor
-LOUPE_R = 60              # half-size (source px) of the loupe region
+EXPORT_DIR = os.path.join(HERE, "exports")
+AUDIT_PATH = os.path.join(ANN_DIR, ".audit.log")
+MAX_DISP_H = 820
+LOUPE = 3
+LOUPE_R = 60
+PAD = 14                  # border padding around the video
+HDR = 64                  # header height (title + stats + progress strip)
+SIDEBAR = 240             # right sidebar width (controls + buttons)
+VID_EXTS = (".mov", ".mp4", ".avi", ".m4v", ".mkv")
+
+# heat map (3-frame intersection) — see heatmap spec / combined_tracer.py
+HEAT_HOT = 25.0
+HEAT_DOWNSCALE = 2.0
+VIEW_MODES = ("FRAME", "OVERLAY", "HEAT ONLY")
+
+BG = (28, 26, 24)         # window chrome
+PANEL = (40, 38, 35)      # sidebar panel
+
+# Audit-trail encryption PUBLIC key. This can only ENCRYPT: the matching
+# private key (which alone can decrypt exported audit files) exists only on
+# the project owner's machine and is never distributed or committed.
+_PUB_PEM = b"""-----BEGIN PUBLIC KEY-----
+MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAhY11P6zShn1nbgzScZkt
+RUIHR3R3G+Vcq5hMOABauDlXnC7PhGniIXOe/t8teQekbeoBYnH+0NDkSo6Id1GE
+w6AuMkbrBtTGns+F1x5stqv+Hp73lX4wXeDsTnrh176OwVJR14VA6Vp9Krm61SkY
+vIlsyJO+rn8X//SFFua8lwIWTJzCuxA6RN7L/ZRgh+DcmAJwAKw9wH7cV2XsFcjv
+KdQbOLrs4SklAw79LobOIGJMXVeSYLSdVxBlLpVetVWwy2K0T6boTDx7NRWYhWgU
+XK8+eXNJ2QQ99gWLgh9wRAlIIjZGKXSNEVyZCLZ5+irPPWO52T8VCqn2tlDHQ2k9
+9ZfDfagrQFb+d9AvmLM6xVG+e6T7PaKoxTdRLrvoQZOW1Y9NOauAHYn+HojJU8M9
+p7EYnUQwOJyjFiXZT3rHsEoTqGUIFkA5o0c6eL4wJiavcyW4hY1hghF56MaG1cKl
+DWhhdCCbGG7E3TVWQkqRjIDb/vIQuTg009uA8DfnW6YH6JLUTEwUcnMMj6GspZzd
+HrbXfX3zG7pcz9krrvn2cMfN/M8utX2pzga5OwB/VAOsTaNpwhpBCnoBKPmWoXbO
+L19cBrxqgshszZankxrWfNyxpKa5oJdlx0FAWrF+GZSsgRM67/mkboIe3pBBRBjm
+fL59cC1tQpgpV3S/nrkIwSUCAwEAAQ==
+-----END PUBLIC KEY-----
+"""
+
+SIDEBAR_KEYS = [
+    ("CONTROLS", None),
+    ("click 1", "club head"),
+    ("click 2", "shaft end"),
+    ("x", "mark occluded"),
+    ("u", "undo frame"),
+    ("n", "next un-annotated"),
+    ("a / d", "prev / next frame"),
+    ("v", "cycle view"),
+    ("z", "magnifier loupe"),
+    ("e", "export session"),
+    ("s", "save now"),
+    ("q / esc", "save and quit"),
+]
 
 
+# ---------------------------------------------------------------- audit trail
+def _now_iso():
+    return datetime.now().isoformat(timespec="milliseconds")
+
+
+def _audit_last_mac():
+    try:
+        with open(AUDIT_PATH, "rb") as fh:
+            lines = fh.read().splitlines()
+        if lines:
+            return json.loads(lines[-1])["mac"]
+    except (OSError, ValueError, KeyError):
+        pass
+    return ""
+
+
+def audit_append(clip, frame, action, data):
+    """Append one hash-chained record; any later edit breaks the chain."""
+    rec = {"ts": _now_iso(), "clip": clip, "frame": frame,
+           "action": action, "data": data, "prev": _audit_last_mac()}
+    payload = json.dumps(rec, sort_keys=True, separators=(",", ":"))
+    rec["mac"] = hashlib.sha256(payload.encode()).hexdigest()
+    with open(AUDIT_PATH, "a") as fh:
+        fh.write(json.dumps(rec, sort_keys=True, separators=(",", ":")) + "\n")
+
+
+def encrypt_bytes(data):
+    """Hybrid RSA-OAEP + AES-GCM: readable only with the owner's private key.
+    Layout: len(wrapped_key):4 | wrapped_key | nonce:12 | ciphertext+tag"""
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    pub = serialization.load_pem_public_key(_PUB_PEM)
+    aes_key = os.urandom(32)
+    nonce = os.urandom(12)
+    ct = AESGCM(aes_key).encrypt(nonce, data, None)
+    wrapped = pub.encrypt(aes_key, padding.OAEP(
+        mgf=padding.MGF1(algorithm=hashes.SHA256()),
+        algorithm=hashes.SHA256(), label=None))
+    return len(wrapped).to_bytes(4, "big") + wrapped + nonce + ct
+
+
+# ---------------------------------------------------------------- heat maps
+def _pair_gray(frame_bgr, downscale=HEAT_DOWNSCALE):
+    fx = 1.0 / downscale
+    small = cv2.resize(frame_bgr, None, fx=fx, fy=fx, interpolation=cv2.INTER_AREA)
+    return cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+
+
+def registered_pair_heat(prev_bgr, curr_bgr, prev_gray=None):
+    """Half-res diff of two frames with global camera motion compensated out."""
+    cv2.setRNGSeed(1234)                      # RANSAC determinism — do not remove
+    g0 = prev_gray if prev_gray is not None else _pair_gray(prev_bgr)
+    g1 = _pair_gray(curr_bgr)
+    try:
+        pts0 = cv2.goodFeaturesToTrack(g0, maxCorners=200, qualityLevel=0.01,
+                                       minDistance=10)
+        if pts0 is not None and len(pts0) >= 12:
+            pts1, st, _ = cv2.calcOpticalFlowPyrLK(g0, g1, pts0, None)
+            ok = st.reshape(-1) == 1
+            if int(ok.sum()) >= 12:
+                M, _ = cv2.estimateAffinePartial2D(
+                    pts0[ok], pts1[ok], method=cv2.RANSAC,
+                    ransacReprojThreshold=2.0)
+                if M is not None:
+                    g0 = cv2.warpAffine(g0, M, (g1.shape[1], g1.shape[0]),
+                                        flags=cv2.INTER_LINEAR,
+                                        borderMode=cv2.BORDER_REPLICATE)
+    except cv2.error:
+        pass                                   # unregistered fallback
+    return cv2.absdiff(g0, g1), g1
+
+
+# ---------------------------------------------------------------- video picker
 def find_videos():
-    """All videos under videos/, any folder depth, as relative paths."""
     vids = []
     for root, _dirs, files in os.walk(VID_DIR):
-        for f in files:
-            if f.lower().endswith(VIDEO_EXTS) and not f.startswith("."):
-                vids.append(os.path.relpath(os.path.join(root, f), VID_DIR))
+        for f in sorted(files):
+            if f.lower().endswith(VID_EXTS) and not f.startswith("."):
+                vids.append(os.path.join(root, f))
     return sorted(vids)
 
 
+def clip_id(path):
+    rel = os.path.relpath(path, VID_DIR)
+    if rel.startswith(".."):                       # video outside videos/
+        rel = os.path.basename(path)
+    return os.path.splitext(rel)[0].replace(os.sep, "__")
+
+
 def pick_video():
+    os.makedirs(VID_DIR, exist_ok=True)
     vids = find_videos()
     if not vids:
-        raise SystemExit(f"no videos found in {VID_DIR}")
+        raise SystemExit(f"no videos found in {VID_DIR} (subfolders are scanned too)")
     for i, v in enumerate(vids):
-        print(f"  [{i}] {v}")
+        p = os.path.join(ANN_DIR, f"{clip_id(v)}.csv")
+        n = 0
+        if os.path.exists(p):
+            with open(p) as fh:
+                n = max(0, sum(1 for _ in fh) - 1)
+        mark = f"  ({n} annotated)" if n else ""
+        print(f"  [{i}] {os.path.relpath(v, VID_DIR)}{mark}")
     s = input("clip number (or path): ").strip()
     if s.isdigit():
-        return os.path.join(VID_DIR, vids[int(s)])
+        return vids[int(s)]
     return s
 
 
-# ---- output slots ----------------------------------------------------
-def _load_manifest():
-    if os.path.exists(MANIFEST):
-        with open(MANIFEST) as fh:
-            return json.load(fh)
-    return {}
-
-
-def _save_manifest(m):
-    tmp = MANIFEST + ".tmp"
-    with open(tmp, "w") as fh:
-        json.dump(m, fh, indent=2, sort_keys=True)
-    os.replace(tmp, MANIFEST)
-
-
-def assign_output(video_path):
-    """Return (video_copy_path, csv_path) for this source video.
-
-    First open: create output/<today>/, copy the video in as
-    <today>_<serial>.<ext>, record the mapping in the manifest.
-    Later opens: reuse the recorded slot so annotation resumes.
-
-    manifest.json: { "<source relpath>": {"slot": "<date>/<date>_<serial>",
-                                          "frames": <total or null> } }
-    """
-    os.makedirs(OUT_DIR, exist_ok=True)
-    src_key = os.path.relpath(os.path.abspath(video_path), VID_DIR)
-    manifest = _load_manifest()
-    if src_key in manifest:
-        stem = os.path.join(OUT_DIR, manifest[src_key]["slot"])
-        ext = os.path.splitext(video_path)[1]
-        return stem + ext, stem + ".csv"
+# ---------------------------------------------------------------- export
+def export_session():
+    """Zip everything annotated today (since the day's first annotation)."""
     today = date.today().isoformat()
-    day_dir = os.path.join(OUT_DIR, today)
-    os.makedirs(day_dir, exist_ok=True)
-    # next free serial within today's folder
-    used = set()
-    for f in os.listdir(day_dir):
-        name = os.path.splitext(f)[0]
-        if name.startswith(today + "_"):
-            tail = name[len(today) + 1:]
-            if tail.isdigit():
-                used.add(int(tail))
-    serial = 1
-    while serial in used:
-        serial += 1
-    name = f"{today}_{serial:03d}"
-    ext = os.path.splitext(video_path)[1]
-    dst_vid = os.path.join(day_dir, name + ext)
-    if not os.path.exists(dst_vid):
-        print(f"copying video -> {dst_vid}")
-        shutil.copy2(video_path, dst_vid)
-    manifest[src_key] = {"slot": os.path.join(today, name), "frames": None}
-    _save_manifest(manifest)
-    return dst_vid, os.path.join(day_dir, name + ".csv")
+    os.makedirs(EXPORT_DIR, exist_ok=True)
+    out = os.path.join(EXPORT_DIR,
+                       f"session_{today}_{datetime.now().strftime('%H%M%S')}.zip")
+    header = ["frame", "head_x", "head_y", "grip_x", "grip_y", "state", "ts"]
+    n_clips = 0
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
+        for csvf in sorted(glob.glob(os.path.join(ANN_DIR, "*.csv"))):
+            with open(csvf) as fh:
+                rows = [r for r in csv.DictReader(fh)
+                        if r.get("ts", "").startswith(today)]
+            if not rows:
+                continue
+            n_clips += 1
+            lines = [",".join(header)]
+            for r in rows:
+                lines.append(",".join(r.get(c, "") for c in header))
+            zf.writestr(os.path.basename(csvf), "\n".join(lines) + "\n")
+        if os.path.exists(AUDIT_PATH):
+            with open(AUDIT_PATH, "rb") as fh:
+                zf.writestr("session.audit.enc", encrypt_bytes(fh.read()))
+    if n_clips == 0:
+        os.remove(out)
+        return None
+    return out
 
 
-def record_total_frames(video_path, n):
-    """Store the decoder-true frame count so the picker can show progress."""
-    src_key = os.path.relpath(os.path.abspath(video_path), VID_DIR)
-    manifest = _load_manifest()
-    if src_key in manifest and manifest[src_key].get("frames") != n:
-        manifest[src_key]["frames"] = n
-        _save_manifest(manifest)
-
-
-def annotation_status(rel):
-    """(status_text, done, total) for one videos/-relative path."""
-    manifest = _load_manifest()
-    entry = manifest.get(rel)
-    if entry is None:
-        return "not started", 0, None
-    csv_path = os.path.join(OUT_DIR, entry["slot"] + ".csv")
-    done = 0
-    if os.path.exists(csv_path):
-        with open(csv_path) as fh:
-            done = max(0, sum(1 for _ in fh) - 1)      # minus header
-    total = entry.get("frames")
-    if done == 0:
-        return "opened, 0 frames", 0, total
-    if total:
-        pct = 100 * done // total
-        tag = "DONE" if done >= total else f"{pct}%"
-        return f"{done}/{total} frames ({tag})", done, total
-    return f"{done} frames", done, None
-
-
+# ---------------------------------------------------------------- annotator
 class Annotator:
     def __init__(self, path):
         self.path = path
-        self.cap = cv2.VideoCapture(path)
-        if not self.cap.isOpened():
+        self.clip = clip_id(path)
+        cap = cv2.VideoCapture(path)
+        if not cap.isOpened():
             raise SystemExit(f"cannot open {path}")
-        self.N = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        self.W = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        self.H = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self.N = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        cap.release()
         self.sc = min(1.0, MAX_DISP_H / self.H)
         self.dw, self.dh = int(self.W * self.sc), int(self.H * self.sc)
-        # ann[frame] = ("ok", hx, hy, gx, gy) or ("occluded", None...)
+        self.win_w = PAD + self.dw + PAD + SIDEBAR
+        self.win_h = HDR + self.dh + PAD
+        # ann[frame] = ("ok", hx, hy, gx, gy, ts) or ("occluded", None x4, ts)
         self.ann = {}
         self.f = 0
-        self.pending_head = None      # first click held until the grip click
+        self.pending_head = None
         self.loupe = False
+        self.view = 0                 # index into VIEW_MODES
         self.mouse = (0, 0)
-        self._jpegs = None            # one-shot sequential decode, held as JPEG
-        self._raw_cache = (-1, None)  # last full-res frame, decoded from JPEG
-        self._disp_cache = (-1, None) # last display-size frame
-        _vid_copy, self.csv_path = assign_output(path)
-        self.clip = os.path.splitext(os.path.basename(self.csv_path))[0]
+        self.msg = ""
+        self.msg_until = 0.0
+        self._all_frames = None
+        self._heat = None             # heat[i] = pair diff of frames i, i+1
+        os.makedirs(ANN_DIR, exist_ok=True)
+        self.csv_path = os.path.join(ANN_DIR, f"{self.clip}.csv")
         self._load()
 
     # ---- persistence -------------------------------------------------
@@ -191,11 +278,13 @@ class Annotator:
         with open(self.csv_path) as fh:
             for row in csv.DictReader(fh):
                 fr = int(row["frame"])
+                ts = row.get("ts", "")          # older versions had no ts
                 if row["state"] == "occluded":
-                    self.ann[fr] = ("occluded", None, None, None, None)
+                    self.ann[fr] = ("occluded", None, None, None, None, ts)
                 else:
-                    self.ann[fr] = ("ok", float(row["head_x"]), float(row["head_y"]),
-                                    float(row["grip_x"]), float(row["grip_y"]))
+                    self.ann[fr] = ("ok",
+                                    float(row["head_x"]), float(row["head_y"]),
+                                    float(row["grip_x"]), float(row["grip_y"]), ts)
         print(f"resumed {len(self.ann)} annotated frames from {self.csv_path}")
         nxt = self._next_unannotated(0)
         self.f = nxt if nxt is not None else 0
@@ -204,59 +293,52 @@ class Annotator:
         tmp = self.csv_path + ".tmp"
         with open(tmp, "w", newline="") as fh:
             w = csv.writer(fh)
-            w.writerow(["frame", "head_x", "head_y", "grip_x", "grip_y", "state"])
+            w.writerow(["frame", "head_x", "head_y", "grip_x", "grip_y",
+                        "state", "ts"])
             for fr in sorted(self.ann):
-                st, hx, hy, gx, gy = self.ann[fr]
+                st, hx, hy, gx, gy, ts = self.ann[fr]
                 if st == "occluded":
-                    w.writerow([fr, "", "", "", "", "occluded"])
+                    w.writerow([fr, "", "", "", "", "occluded", ts])
                 else:
                     w.writerow([fr, f"{hx:.1f}", f"{hy:.1f}",
-                                f"{gx:.1f}", f"{gy:.1f}", "ok"])
+                                f"{gx:.1f}", f"{gy:.1f}", "ok", ts])
         os.replace(tmp, self.csv_path)
 
-    # ---- frames ------------------------------------------------------
-    # NEVER SEEK. cap.set(CAP_PROP_POS_FRAMES) is unreliable on these files:
-    # the decoded frame can be one early/late or garbage, which silently shifts
-    # every annotation. All frames are decoded ONCE, sequentially — the only
-    # mode the decoder gets right. Raw BGR frames cost ~8 MB each (several GB
-    # per clip, enough to push a 16 GB machine into swap, stalling the GUI), so
-    # frames are held JPEG-encoded (~0.2 MB, q=98, visually lossless at
-    # annotation zoom) and decoded on demand, with the current frame cached.
-    def _decode_all(self):
-        if self._jpegs is not None:
-            return
-        print("decoding all frames sequentially (no seeking) ...")
-        self._jpegs = []
-        cap = cv2.VideoCapture(self.path)
-        while True:
-            ok, img = cap.read()
-            if not ok:
-                break
-            ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 98])
-            self._jpegs.append(buf if ok else None)
-        cap.release()
-        self.N = len(self._jpegs)          # decoder truth beats the header count
-        record_total_frames(self.path, self.N)
-        print(f"decoded {self.N} frames")
-
+    # ---- frames + heat -----------------------------------------------
+    # NEVER SEEK. cap.set(CAP_PROP_POS_FRAMES) is unreliable on these files
+    # (frames come back one early/late or garbage, silently shifting every
+    # annotation). Decode ONCE sequentially and hold in memory.
     def _get(self, fr):
-        self._decode_all()
-        if self._raw_cache[0] == fr:
-            return self._raw_cache[1]
-        img = None
-        if 0 <= fr < len(self._jpegs) and self._jpegs[fr] is not None:
-            img = cv2.imdecode(self._jpegs[fr], cv2.IMREAD_COLOR)
-        self._raw_cache = (fr, img)
-        return img
+        if self._all_frames is None:
+            print("decoding all frames sequentially (no seeking) ...")
+            self._all_frames = []
+            cap = cv2.VideoCapture(self.path)
+            while True:
+                ok, img = cap.read()
+                if not ok:
+                    break
+                self._all_frames.append(img)
+            cap.release()
+            self.N = len(self._all_frames)
+            print("computing motion heat maps ...")
+            self._heat, prev_gray = [], None
+            for i in range(self.N - 1):
+                h, prev_gray = registered_pair_heat(
+                    self._all_frames[i], self._all_frames[i + 1],
+                    prev_gray=prev_gray)
+                self._heat.append(h)
+            print("ready")
+        if 0 <= fr < len(self._all_frames):
+            return self._all_frames[fr]
+        return None
 
-    def _get_disp(self, fr):
-        """Display-size frame, cached so the 50 Hz redraw does no work."""
-        if self._disp_cache[0] == fr:
-            return self._disp_cache[1]
-        img = self._get(fr)
-        disp = cv2.resize(img, (self.dw, self.dh)) if img is not None else self._blank()
-        self._disp_cache = (fr, disp)
-        return disp
+    def _membership(self, fr):
+        """3-frame intersection map for frame fr: min(heat[fr-1], heat[fr]).
+        A pixel is hot only if it moved into AND out of this frame — a
+        one-frame flash cancels, a sweeping club survives. None at the ends."""
+        if not self._heat or fr < 1 or fr >= len(self._heat):
+            return None
+        return np.minimum(self._heat[fr - 1], self._heat[fr])
 
     def _next_unannotated(self, start):
         for fr in range(start, self.N):
@@ -264,67 +346,189 @@ class Annotator:
                 return fr
         return None
 
+    def _advance(self):
+        nxt = self._next_unannotated(self.f + 1)
+        self.f = nxt if nxt is not None else min(self.f + 1, self.N - 1)
+
+    def _flash(self, text, secs=3.0):
+        self.msg, self.msg_until = text, time.time() + secs
+
+    # ---- layout ------------------------------------------------------
+    def _sidebar_x(self):
+        return PAD + self.dw + PAD
+
+    def _export_btn_rect(self):
+        x = self._sidebar_x() + 12
+        return (x, self.win_h - PAD - 34, x + SIDEBAR - 36, self.win_h - PAD - 6)
+
+    def _view_btn_rect(self):
+        x = self._sidebar_x() + 12
+        return (x, self.win_h - PAD - 72, x + SIDEBAR - 36, self.win_h - PAD - 44)
+
     # ---- mouse -------------------------------------------------------
     def on_mouse(self, event, x, y, flags, _):
         self.mouse = (x, y)
         if event != cv2.EVENT_LBUTTONDOWN:
             return
-        ox, oy = x / self.sc, y / self.sc                # -> original px
+        for rect, fn in ((self._export_btn_rect(), self._do_export),
+                         (self._view_btn_rect(), self._cycle_view)):
+            if rect[0] <= x <= rect[2] and rect[1] <= y <= rect[3]:
+                fn()
+                return
+        if not (PAD <= x < PAD + self.dw and HDR <= y < HDR + self.dh):
+            return                                       # clicks on chrome ignored
+        ox, oy = (x - PAD) / self.sc, (y - HDR) / self.sc    # -> original px
         if self.pending_head is None:
-            self.pending_head = (ox, oy)                 # first click = head
+            self.pending_head = (ox, oy)                 # 1st click = head
         else:
             hx, hy = self.pending_head
-            self.ann[self.f] = ("ok", hx, hy, ox, oy)    # second = grip
-            self.last_edit = self.f
+            self.ann[self.f] = ("ok", hx, hy, ox, oy, _now_iso())
             self.pending_head = None
             self._save()
-            nxt = self._next_unannotated(self.f + 1)
-            self.f = nxt if nxt is not None else min(self.f + 1, self.N - 1)
+            audit_append(self.clip, self.f, "annotate",
+                         {"head": [round(hx, 1), round(hy, 1)],
+                          "grip": [round(ox, 1), round(oy, 1)], "state": "ok"})
+            self._advance()
+
+    def _cycle_view(self):
+        self.view = (self.view + 1) % len(VIEW_MODES)
+
+    def _do_export(self):
+        out = export_session()
+        if out:
+            audit_append(self.clip, -1, "export", {"zip": os.path.basename(out)})
+            self._flash(f"exported -> exports/{os.path.basename(out)}", 5)
+            print(f"session export: {out}")
+        else:
+            self._flash("nothing annotated today - nothing to export")
 
     # ---- render ------------------------------------------------------
+    def _video_panel(self, img):
+        """The frame under the current view mode, at display size."""
+        frame = cv2.resize(img, (self.dw, self.dh)) if img is not None \
+            else np.zeros((self.dh, self.dw, 3), "uint8")
+        mode = VIEW_MODES[self.view]
+        if mode == "FRAME":
+            return frame
+        m = self._membership(self.f)
+        if m is None:                 # first/last frame: no map on one side
+            cv2.putText(frame, "no heat map at first/last frame", (12, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2,
+                        cv2.LINE_AA)
+            return frame
+        # INTER_NEAREST: interpolation would smear hot pixels
+        big = cv2.resize(m, (self.dw, self.dh), interpolation=cv2.INTER_NEAREST)
+        heat = cv2.applyColorMap(big, cv2.COLORMAP_INFERNO)
+        if mode == "HEAT ONLY":
+            return heat
+        # OVERLAY: blend the colormap onto hot pixels only
+        mask = big >= HEAT_HOT
+        out = frame.copy()
+        out[mask] = (0.35 * out[mask] + 0.65 * heat[mask]).astype(np.uint8)
+        return out
+
     def draw(self):
-        disp = self._get_disp(self.f).copy()
+        img = self._get(self.f)
+        disp = np.zeros((self.win_h, self.win_w, 3), "uint8")
+        disp[:] = BG
+        disp[HDR:HDR + self.dh, PAD:PAD + self.dw] = self._video_panel(img)
+        cv2.rectangle(disp, (PAD - 1, HDR - 1),
+                      (PAD + self.dw, HDR + self.dh), (70, 70, 70), 1)
         a = self.ann.get(self.f)
         if a and a[0] == "ok":
-            hx, hy, gx, gy = (a[1] * self.sc, a[2] * self.sc,
-                              a[3] * self.sc, a[4] * self.sc)
+            hx, hy = a[1] * self.sc + PAD, a[2] * self.sc + HDR
+            gx, gy = a[3] * self.sc + PAD, a[4] * self.sc + HDR
             cv2.line(disp, (int(gx), int(gy)), (int(hx), int(hy)), (0, 255, 0), 2)
-            cv2.circle(disp, (int(gx), int(gy)), 6, (0, 220, 255), -1)   # grip
-            cv2.circle(disp, (int(hx), int(hy)), 6, (0, 0, 255), -1)     # head
+            cv2.circle(disp, (int(gx), int(gy)), 6, (0, 220, 255), -1)  # shaft end
+            cv2.circle(disp, (int(hx), int(hy)), 6, (0, 0, 255), -1)    # head
         if self.pending_head is not None:
-            px, py = self.pending_head[0] * self.sc, self.pending_head[1] * self.sc
+            px = self.pending_head[0] * self.sc + PAD
+            py = self.pending_head[1] * self.sc + HDR
             cv2.circle(disp, (int(px), int(py)), 6, (0, 0, 255), 2)
-            # live rubber-band shaft line to the cursor
-            cv2.line(disp, (int(px), int(py)),
-                     (int(self.mouse[0]), int(self.mouse[1])), (0, 180, 0), 1)
+            cv2.line(disp, (int(px), int(py)), self.mouse, (0, 180, 0), 1)
         self._hud(disp, a)
+        self._sidebar(disp)
         if self.loupe:
-            self._draw_loupe(self._get(self.f), disp)
-        cv2.imshow("annotate", disp)
-
-    def _blank(self):
-        import numpy as np
-        return np.zeros((self.dh, self.dw, 3), "uint8")
+            self._draw_loupe(img, disp)
+        cv2.imshow("GolfWiz Annotator", disp)
 
     def _hud(self, disp, a):
-        done = len(self.ann)
-        if self.pending_head is not None:
+        ok = sum(1 for v in self.ann.values() if v[0] == "ok")
+        occ = len(self.ann) - ok
+        left = self.N - len(self.ann)
+        cv2.putText(disp, self.clip, (PAD, 22), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55, (240, 240, 240), 1, cv2.LINE_AA)
+        stats = f"frame {self.f + 1}/{self.N}   done {ok}   occluded {occ}   left {left}"
+        cv2.putText(disp, stats, (PAD, 44), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45, (170, 170, 170), 1, cv2.LINE_AA)
+        # per-frame progress strip: green=ok, blue=occluded, grey=todo
+        x0s, x1s = PAD, PAD + self.dw
+        y0, y1 = HDR - 10, HDR - 4
+        cv2.rectangle(disp, (x0s, y0), (x1s, y1), (55, 55, 55), -1)
+        span = self.dw
+        for fr, v in self.ann.items():
+            x = x0s + int(fr / max(1, self.N - 1) * (span - 1))
+            col = (90, 200, 90) if v[0] == "ok" else (60, 140, 235)
+            cv2.rectangle(disp, (x, y0),
+                          (min(x + max(1, span // self.N), x1s), y1), col, -1)
+        cx = x0s + int(self.f / max(1, self.N - 1) * (span - 1))
+        cv2.rectangle(disp, (cx, y0 - 2), (cx + 2, y1 + 2), (255, 255, 255), -1)
+        # prompt / flash message under the video
+        if time.time() < self.msg_until:
+            step = self.msg
+        elif self.pending_head is not None:
             step = "click SHAFT END (yellow)"
         elif a and a[0] == "ok":
-            step = "done - d:next  u:undo"
+            step = "done - d next, u undo"
         elif a and a[0] == "occluded":
-            step = "OCCLUDED - u:undo"
+            step = "OCCLUDED - u undo"
         else:
-            step = "click CLUB HEAD (red)   x:occluded  [X = last frame occluded]"
-        bar = f"{self.clip}  frame {self.f}/{self.N-1}  annotated {done}/{self.N}  | {step}"
-        cv2.rectangle(disp, (0, 0), (self.dw, 26), (0, 0, 0), -1)
-        cv2.putText(disp, bar, (6, 19), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                    (255, 255, 255), 1, cv2.LINE_AA)
+            step = "click CLUB HEAD (red)"
+        cv2.putText(disp, step, (PAD, self.win_h - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1,
+                    cv2.LINE_AA)
+
+    def _sidebar(self, disp):
+        x = self._sidebar_x()
+        cv2.rectangle(disp, (x, HDR - 12), (self.win_w - PAD, self.win_h - PAD),
+                      PANEL, -1)
+        cv2.rectangle(disp, (x, HDR - 12), (self.win_w - PAD, self.win_h - PAD),
+                      (70, 70, 70), 1)
+        y = HDR + 14
+        for key, desc in SIDEBAR_KEYS:
+            if desc is None:                               # section header
+                cv2.putText(disp, key, (x + 12, y), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.5, (140, 200, 140), 1, cv2.LINE_AA)
+                y += 10
+                cv2.line(disp, (x + 12, y), (self.win_w - PAD - 12, y),
+                         (70, 70, 70), 1)
+                y += 20
+                continue
+            cv2.putText(disp, key, (x + 12, y), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.42, (230, 230, 230), 1, cv2.LINE_AA)
+            cv2.putText(disp, desc, (x + 90, y), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.42, (160, 160, 160), 1, cv2.LINE_AA)
+            y += 22
+        # VIEW button
+        bx0, by0, bx1, by1 = self._view_btn_rect()
+        cv2.rectangle(disp, (bx0, by0), (bx1, by1), (85, 70, 45), -1)
+        cv2.rectangle(disp, (bx0, by0), (bx1, by1), (170, 140, 90), 1)
+        cv2.putText(disp, f"VIEW: {VIEW_MODES[self.view]}", (bx0 + 12, by1 - 9),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (240, 230, 210), 1,
+                    cv2.LINE_AA)
+        # EXPORT button
+        bx0, by0, bx1, by1 = self._export_btn_rect()
+        cv2.rectangle(disp, (bx0, by0), (bx1, by1), (60, 120, 60), -1)
+        cv2.rectangle(disp, (bx0, by0), (bx1, by1), (110, 200, 110), 1)
+        cv2.putText(disp, "EXPORT SESSION", (bx0 + 12, by1 - 9),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (235, 255, 235), 1,
+                    cv2.LINE_AA)
 
     def _draw_loupe(self, img, disp):
         if img is None:
             return
-        ox, oy = int(self.mouse[0] / self.sc), int(self.mouse[1] / self.sc)
+        mx, my = self.mouse
+        ox, oy = int((mx - PAD) / self.sc), int((my - HDR) / self.sc)
         x0, y0 = max(ox - LOUPE_R, 0), max(oy - LOUPE_R, 0)
         x1, y1 = min(ox + LOUPE_R, self.W), min(oy + LOUPE_R, self.H)
         crop = img[y0:y1, x0:x1]
@@ -335,52 +539,44 @@ class Annotator:
         cv2.drawMarker(z, ((ox - x0) * LOUPE, (oy - y0) * LOUPE),
                        (0, 255, 0), cv2.MARKER_CROSS, 20, 1)
         h, w = z.shape[:2]
-        disp[26:26 + h, self.dw - w:self.dw] = z         # top-right inset
+        disp[HDR:HDR + h, PAD + self.dw - w:PAD + self.dw] = z
 
     # ---- loop --------------------------------------------------------
     def run(self):
-        self._decode_all()            # up front, so the window never opens frozen
-        if self.f >= self.N:
-            self.f = 0
-        cv2.namedWindow("annotate")
-        cv2.setMouseCallback("annotate", self.on_mouse)
+        cv2.namedWindow("GolfWiz Annotator")
+        cv2.setMouseCallback("GolfWiz Annotator", self.on_mouse)
         while True:
             self.draw()
             k = cv2.waitKey(20) & 0xFF
             if k in (ord("q"), 27):
                 break
-            elif k in (ord("n"), ord("d"), 83):
+            elif k == ord("d"):
                 self.f = min(self.f + 1, self.N - 1); self.pending_head = None
-            elif k in (ord("p"), ord("a"), 81):
+            elif k == ord("a"):
                 self.f = max(self.f - 1, 0); self.pending_head = None
-            elif k in (ord("N"), ord("D")):
-                self.f = min(self.f + 10, self.N - 1); self.pending_head = None
-            elif k in (ord("P"), ord("A")):
-                self.f = max(self.f - 10, 0); self.pending_head = None
-            elif k in (ord("u"), 8):
-                self.ann.pop(self.f, None); self.pending_head = None; self._save()
+            elif k == ord("u"):
+                if self.f in self.ann:
+                    self.ann.pop(self.f)
+                    audit_append(self.clip, self.f, "undo", {})
+                self.pending_head = None
+                self._save()
             elif k == ord("x"):
-                self.ann[self.f] = ("occluded", None, None, None, None)
-                self.last_edit = self.f
-                self.pending_head = None; self._save()
-                nxt = self._next_unannotated(self.f + 1)
-                self.f = nxt if nxt is not None else self.f
-            elif k == ord("X"):
-                # THE MISATTRIBUTION FIX. Saving a frame auto-jumps to the next
-                # unannotated frame, so an `x` meant for the frame you JUST
-                # annotated lands on the new frame instead. Shif t-X marks the
-                # LAST EDITED frame occluded and returns there.
-                le = getattr(self, "last_edit", None)
-                if le is not None:
-                    self.ann[le] = ("occluded", None, None, None, None)
-                    self.f = le
-                    self.pending_head = None; self._save()
-            elif k == ord("j"):
+                self.ann[self.f] = ("occluded", None, None, None, None, _now_iso())
+                self.pending_head = None
+                self._save()
+                audit_append(self.clip, self.f, "annotate", {"state": "occluded"})
+                self._advance()
+            elif k == ord("n"):
                 nxt = self._next_unannotated(self.f + 1)
                 if nxt is not None:
                     self.f = nxt
+                self.pending_head = None
+            elif k == ord("v"):
+                self._cycle_view()
             elif k == ord("z"):
                 self.loupe = not self.loupe
+            elif k == ord("e"):
+                self._do_export()
             elif k == ord("s"):
                 self._save()
         self._save()
@@ -388,77 +584,7 @@ class Annotator:
         print(f"saved {len(self.ann)} frames -> {self.csv_path}")
 
 
-# ---- GUI picker ------------------------------------------------------
-def gui_pick_video():
-    """Tk window listing every video with its annotation status.
-
-    Returns the chosen video's absolute path, or None if the window is
-    closed. Falls back to the terminal menu if tkinter is unavailable.
-    """
-    try:
-        import tkinter as tk
-        from tkinter import ttk
-    except ImportError:
-        return pick_video()
-
-    vids = find_videos()
-    if not vids:
-        raise SystemExit(f"no videos found in {VID_DIR}")
-
-    root = tk.Tk()
-    root.title("Swing Annotator - pick a video")
-    root.geometry("640x420")
-    tk.Label(root, text="Double-click a video to annotate it. "
-                        "Close this window to quit.").pack(pady=(8, 4))
-    cols = ("video", "status")
-    tree = ttk.Treeview(root, columns=cols, show="headings", selectmode="browse")
-    tree.heading("video", text="Video")
-    tree.heading("status", text="Annotation status")
-    tree.column("video", width=340)
-    tree.column("status", width=260)
-    sb = ttk.Scrollbar(root, orient="vertical", command=tree.yview)
-    tree.configure(yscrollcommand=sb.set)
-    tree.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=8)
-    sb.pack(side="left", fill="y", pady=8)
-
-    def refresh():
-        tree.delete(*tree.get_children())
-        for v in vids:
-            status, _done, _total = annotation_status(v)
-            tree.insert("", "end", iid=v, values=(v, status))
-    refresh()
-
-    chosen = []
-
-    def on_open(_event=None):
-        sel = tree.selection()
-        if sel:
-            chosen.append(os.path.join(VID_DIR, sel[0]))
-            root.destroy()
-
-    tree.bind("<Double-1>", on_open)
-    tree.bind("<Return>", on_open)
-    tk.Button(root, text="Annotate selected", command=on_open).pack(
-        side="top", pady=8, padx=8)
-    root.mainloop()
-    return chosen[0] if chosen else None
-
-
-def main():
-    if len(sys.argv) > 1 and sys.argv[1] != "--cli":
-        Annotator(sys.argv[1]).run()
-        return
-    if len(sys.argv) > 1 and sys.argv[1] == "--cli":
-        Annotator(pick_video()).run()
-        return
-    # GUI loop: picker -> annotate -> back to picker (with fresh status)
-    while True:
-        vid = gui_pick_video()
-        if vid is None:
-            break
-        Annotator(vid).run()
-
-
 if __name__ == "__main__":
     print(__doc__)
-    main()
+    vid = sys.argv[1] if len(sys.argv) > 1 else pick_video()
+    Annotator(vid).run()
