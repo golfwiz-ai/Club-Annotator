@@ -40,6 +40,12 @@ from datetime import datetime, date
 import cv2
 import numpy as np
 
+# In a windowed (no-console) build stdout/stderr are None; keep print() safe.
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w")
+
 # When frozen by PyInstaller, __file__ lives in a temp extraction dir —
 # anchor all data folders next to the executable instead.
 if getattr(sys, "frozen", False):
@@ -584,7 +590,153 @@ class Annotator:
         print(f"saved {len(self.ann)} frames -> {self.csv_path}")
 
 
+def clip_stats(path):
+    """(done, occluded, total_frames, last_edit 'YYYY-MM-DD HH:MM') for a video."""
+    done = occ = 0
+    last = ""
+    p = os.path.join(ANN_DIR, f"{clip_id(path)}.csv")
+    if os.path.exists(p):
+        with open(p) as fh:
+            for row in csv.DictReader(fh):
+                if row["state"] == "occluded":
+                    occ += 1
+                else:
+                    done += 1
+                ts = row.get("ts", "")
+                if ts > last:
+                    last = ts
+    cap = cv2.VideoCapture(path)
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if cap.isOpened() else 0
+    cap.release()
+    last_disp = last[:16].replace("T", " ") if last else "-"
+    return done, occ, total, last_disp
+
+
+# ---- GUI launcher ----------------------------------------------------
+def gui_pick_video():
+    """Tk window listing every swing with its analytics.
+
+    Returns the chosen video's absolute path, or None if the window is
+    closed. Falls back to the terminal menu if tkinter is unavailable.
+    """
+    try:
+        import tkinter as tk
+        from tkinter import ttk, messagebox
+    except ImportError:
+        return pick_video()
+
+    os.makedirs(VID_DIR, exist_ok=True)
+    vids = find_videos()
+
+    root = tk.Tk()
+    root.title("GolfWiz Annotator")
+    root.geometry("860x560")
+    root.configure(bg="#1c1a18")
+
+    style = ttk.Style(root)
+    try:
+        style.theme_use("clam")
+    except tk.TclError:
+        pass
+    style.configure("Treeview", rowheight=26, font=("Helvetica", 12),
+                    background="#262421", fieldbackground="#262421",
+                    foreground="#e8e6e3")
+    style.configure("Treeview.Heading", font=("Helvetica", 12, "bold"))
+
+    tk.Label(root, text="GolfWiz Annotator", font=("Helvetica", 18, "bold"),
+             bg="#1c1a18", fg="#e8e6e3").pack(pady=(14, 2))
+    summary = tk.Label(root, font=("Helvetica", 12), bg="#1c1a18", fg="#9a978f")
+    summary.pack(pady=(0, 8))
+
+    frame = tk.Frame(root, bg="#1c1a18")
+    frame.pack(fill="both", expand=True, padx=14)
+    cols = ("swing", "progress", "done", "occluded", "left", "last")
+    tree = ttk.Treeview(frame, columns=cols, show="headings", selectmode="browse")
+    for c, txt, w, anchor in (
+            ("swing", "Swing", 250, "w"), ("progress", "Progress", 110, "center"),
+            ("done", "Annotated", 80, "center"), ("occluded", "Occluded", 80, "center"),
+            ("left", "Left", 60, "center"), ("last", "Last edit", 140, "center")):
+        tree.heading(c, text=txt)
+        tree.column(c, width=w, anchor=anchor)
+    sb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+    tree.configure(yscrollcommand=sb.set)
+    tree.pack(side="left", fill="both", expand=True)
+    sb.pack(side="left", fill="y")
+    tree.tag_configure("full", foreground="#7fd67f")
+    tree.tag_configure("part", foreground="#e8d27f")
+
+    def refresh():
+        tree.delete(*tree.get_children())
+        tot_done = tot_frames = full = 0
+        for v in vids:
+            done, occ, total, last = clip_stats(v)
+            marked = done + occ
+            tot_done += marked
+            tot_frames += total
+            pct = 100 * marked // total if total else 0
+            if total and marked >= total:
+                full += 1
+                tag = ("full",)
+            elif marked:
+                tag = ("part",)
+            else:
+                tag = ()
+            tree.insert("", "end", iid=v, tags=tag, values=(
+                os.path.relpath(v, VID_DIR), f"{pct}%  ({marked}/{total})",
+                done, occ, max(0, total - marked), last))
+        summary.config(text=(
+            f"{len(vids)} swings   |   {full} fully annotated   |   "
+            f"{tot_done}/{tot_frames} frames done "
+            f"({100 * tot_done // tot_frames if tot_frames else 0}%)"))
+        if not vids:
+            summary.config(text=f"No videos found - put clips in {VID_DIR}")
+    refresh()
+
+    chosen = []
+
+    def on_open(_event=None):
+        sel = tree.selection()
+        if sel:
+            chosen.append(sel[0])
+            root.destroy()
+
+    def on_export():
+        out = export_session()
+        if out:
+            audit_append("-", -1, "export", {"zip": os.path.basename(out)})
+            messagebox.showinfo("Export", f"Session exported:\n{out}")
+        else:
+            messagebox.showinfo("Export", "Nothing annotated today - nothing to export.")
+
+    tree.bind("<Double-1>", on_open)
+    tree.bind("<Return>", on_open)
+    btns = tk.Frame(root, bg="#1c1a18")
+    btns.pack(pady=10)
+    tk.Button(btns, text="Annotate selected", command=on_open,
+              font=("Helvetica", 12)).pack(side="left", padx=6)
+    tk.Button(btns, text="Export session", command=on_export,
+              font=("Helvetica", 12)).pack(side="left", padx=6)
+    tk.Label(root, text="Double-click a swing to annotate it. Close this window to quit.",
+             bg="#1c1a18", fg="#9a978f").pack(pady=(0, 10))
+    root.mainloop()
+    return chosen[0] if chosen else None
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "--cli":
+        Annotator(pick_video()).run()
+        return
+    if len(sys.argv) > 1:
+        Annotator(sys.argv[1]).run()
+        return
+    # GUI loop: picker -> annotate -> back to picker (with fresh stats)
+    while True:
+        vid = gui_pick_video()
+        if vid is None:
+            break
+        Annotator(vid).run()
+
+
 if __name__ == "__main__":
     print(__doc__)
-    vid = sys.argv[1] if len(sys.argv) > 1 else pick_video()
-    Annotator(vid).run()
+    main()
